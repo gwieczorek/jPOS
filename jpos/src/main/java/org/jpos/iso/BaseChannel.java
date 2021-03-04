@@ -39,6 +39,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Observable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /*
  * BaseChannel was ISOChannel. Now ISOChannel is an interface
@@ -74,6 +79,8 @@ public abstract class BaseChannel extends Observable
     implements FilteredChannel, ClientChannel, ServerChannel, FactoryChannel, 
                LogSource, Configurable, BaseChannelMBean, Cloneable, ExceptionHandlerAware
 {
+    protected static ScheduledExecutorService executor = initExecutor();
+
     private Socket socket;
     private String host, localIface;
     private String[] hosts;
@@ -98,6 +105,8 @@ public abstract class BaseChannel extends Observable
     protected ServerSocket serverSocket = null;
     protected List<ISOFilter> incomingFilters, outgoingFilters;
     protected ISOClientSocketFactory socketFactory = null;
+
+    protected long socketWriteTimeout;
 
     protected int[] cnt;
 
@@ -160,6 +169,17 @@ public abstract class BaseChannel extends Observable
         this();
         setPackager (p);
         setServerSocket (serverSocket);
+    }
+
+    private static ScheduledExecutorService initExecutor() {
+        ScheduledExecutorService es = Executors.newScheduledThreadPool(1);
+        if (es instanceof ScheduledThreadPoolExecutor) {
+            ScheduledThreadPoolExecutor stpe = (ScheduledThreadPoolExecutor) es;
+            stpe.setKeepAliveTime(60, TimeUnit.SECONDS);
+            stpe.allowCoreThreadTimeOut(true);
+            stpe.prestartAllCoreThreads();
+        }
+        return es;
     }
 
     /**
@@ -604,13 +624,16 @@ public abstract class BaseChannel extends Observable
             evt.addMessage (m);
             m.setDirection(ISOMsg.OUTGOING); // filter may have dropped this info
             m.setPackager (p); // and could have dropped packager as well
-            byte[] b = pack(m);
+            final byte[] b = pack(m);
+            final ISOMsg mm = m;
             synchronized (serverOutLock) {
-                sendMessageLength(b.length + getHeaderLength(m));
-                sendMessageHeader(m, b.length);
-                sendMessage (b, 0, b.length);
-                sendMessageTrailer(m, b);
-                serverOut.flush ();
+                guardTimeout(() -> {
+                    sendMessageLength(b.length + getHeaderLength(mm));
+                    sendMessageHeader(mm, b.length);
+                    sendMessage (b, 0, b.length);
+                    sendMessageTrailer(mm, b);
+                    serverOut.flush ();
+                });
             }
             cnt[TX]++;
             setChanged();
@@ -633,6 +656,25 @@ public abstract class BaseChannel extends Observable
             Logger.log (evt);
         }
     }
+
+    private void guardTimeout(RunnableIO c) throws IOException {
+        ScheduledFuture f = null;
+        try {
+            if (socketWriteTimeout > 0) {
+                Runnable t = new TimeoutDisconnectTask(this);
+                f = executor.schedule(t, socketWriteTimeout, TimeUnit.MILLISECONDS);
+            }
+            c.run();
+        } finally {
+            if (f != null)
+                f.cancel(false);
+        }        
+    }
+
+    interface RunnableIO<V> {
+        void run() throws IOException;
+    }
+
     /**
      * sends a byte[] over the TCP/IP session
      * @param b the byte array to be sent
@@ -648,8 +690,10 @@ public abstract class BaseChannel extends Observable
             if (!isConnected())
                 throw new ISOException ("unconnected ISOChannel");
             synchronized (serverOutLock) {
-                serverOut.write(b);
-                serverOut.flush();
+                guardTimeout(() -> {
+                    serverOut.write(b);
+                    serverOut.flush();
+                });
             }
             cnt[TX]++;
             setChanged();
@@ -1034,6 +1078,7 @@ public abstract class BaseChannel extends Observable
         keepAlive = cfg.getBoolean ("keep-alive", false);
         expectKeepAlive = cfg.getBoolean ("expect-keep-alive", false);
         roundRobin = cfg.getBoolean ("round-robin", false);
+        socketWriteTimeout = cfg.getLong("socket-write-timeout", 2000);
         if (socketFactory != this && socketFactory instanceof Configurable)
             ((Configurable)socketFactory).setConfiguration (cfg);
         try {
@@ -1154,4 +1199,5 @@ public abstract class BaseChannel extends Observable
             throw new InternalError();
         }
     }
+
 }
